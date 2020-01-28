@@ -154,6 +154,7 @@ class domainDumpConfig(object):
         self.lookuphostnames = False #Look up hostnames of computers to get their IP address
         self.dnsserver = '' #Addres of the DNS server to use, if not specified default DNS will be used
         self.minimal = False #Only query minimal list of attributes
+        self.reports = 'all'
 
 #Domaindumper main class
 class domainDumper(object):
@@ -411,21 +412,30 @@ class domainDumper(object):
 
     #Main function
     def domainDump(self):
-        self.users = self.getAllUsers()
-        self.computers = self.getAllComputers()
-        self.groups = self.getAllGroups()
-        if self.config.lookuphostnames:
-            self.lookupComputerDnsNames()
-        self.policy = self.getDomainPolicy()
-        self.trusts = self.getTrusts()
+        log_info('Dumping following information: %s' %(''.join(self.config.reports)))
         rw = reportWriter(self.config)
-        rw.generateUsersReport(self)
-        rw.generateGroupsReport(self)
-        rw.generateComputersReport(self)
-        rw.generatePolicyReport(self)
-        rw.generateTrustsReport(self)
-        rw.generateComputersByOsReport(self)
-        rw.generateUsersByGroupReport(self)
+        if 'users' in self.config.reports:
+            self.users = self.getAllUsers()
+            rw.generateUsersReport(self)
+        if 'groups' in self.config.reports:
+            self.groups = self.getAllGroups()
+            rw.generateGroupsReport(self)
+        if 'users' in self.config.reports and 'groups' in self.config.reports:
+            rw.generateUsersByGroupReport(self)
+        if 'computers' in self.config.reports:
+            self.computers = self.getAllComputers()
+            if self.config.lookuphostnames:
+                self.lookupComputerDnsNames()
+            rw.generateComputersReport(self)
+            rw.generateComputersByOsReport(self)
+        if 'policy' in self.config.reports:
+            self.policy = self.getDomainPolicy()
+            rw.generatePolicyReport(self)
+        if 'trusts' in self.config.reports:
+            self.trusts = self.getTrusts()
+            rw.generateTrustsReport(self)
+        
+        
 
 class reportWriter(object):
     def __init__(self, config):
@@ -864,6 +874,9 @@ def main():
     parser.add_argument("-u", "--user", type=native_str, metavar='USERNAME', help="DOMAIN\\username for authentication, leave empty for anonymous authentication")
     parser.add_argument("-p", "--password", type=native_str, metavar='PASSWORD', help="Password or LM:NTLM hash, will prompt if not specified")
     parser.add_argument("-at", "--authtype", type=str, choices=['NTLM', 'SIMPLE'], default='NTLM', help="Authentication type (NTLM or SIMPLE, default: NTLM)")
+    parser.add_argument("--ssl", action='store_true', help="Connect to LDAP server using SSL")
+    parser.add_argument("--referralhosts", action='store_true', help="Allow passthrough authentication to all referral hosts")
+    parser.add_argument("--sslprotocol", type=native_str, help="SSL version for LDAP connection, can be SSLv23, TLSv1, TLSv1_1 or TLSv1_2")
 
     #Output parameters
     outputgroup = parser.add_argument_group("Output options")
@@ -879,6 +892,7 @@ def main():
     miscgroup.add_argument("-r", "--resolve", action='store_true', help="Resolve computer hostnames (might take a while and cause high traffic on large networks)")
     miscgroup.add_argument("-n", "--dns-server", help="Use custom DNS resolver instead of system DNS (try a domain controller IP)")
     miscgroup.add_argument("-m", "--minimal", action='store_true', default=False, help="Only query minimal set of attributes to limit memmory usage")
+    miscgroup.add_argument("-t", "--types", type=native_str, default="all", help="Only perform the specified queries out of: users,groups,computers,policy,trusts")
 
     args = parser.parse_args()
     #Create default config
@@ -910,6 +924,19 @@ def main():
     #Do we really need grouped json files?
     cnf.groupedjson = args.grouped_json
 
+
+    queries = ['users', 'groups', 'computers', 'policy', 'trusts']
+    
+    reports = [a.lstrip().rstrip() for a in args.types.split(',')]
+    if reports == ['all']:
+        reports = queries
+    elif [a for a in reports if a not in queries]:
+        print('Bad output types: ' + ','.join([a for a in reports if a not in queries]))
+        sys.exit(1)
+      
+    
+    cnf.reports = reports
+
     #Prompt for password if not set
     authentication = None
     if args.user is not None:
@@ -926,9 +953,21 @@ def main():
         log_info('Connecting as anonymous user, dumping will probably fail. Consider specifying a username/password to login with')
     # define the server and the connection
     s = Server(args.host, get_info=ALL)
+    if args.ssl:
+        s = Server(args.host, get_info=ALL, port=636, use_ssl=True)
+    if args.sslprotocol:
+        v = {'SSLv23' : 2, 'TLSv1' : 3, 'TLSv1_1' : 4, 'TLSv1_2' : 5}
+        if args.sslprotocol not in v.keys():
+            print('Bad SSL Protocol: %s' %(args.sslprotocol))
+            parser.print_help(sys.stderr)
+            sys.exit(1)
+        s = Server(args.host, get_info=ALL, port=636, use_ssl=True, tls=Tls(validate=0, version=v[args.sslprotocol]) )
+    if args.referralhosts:
+        s.allowed_referral_hosts = [('*', True)]
     log_info('Connecting to host...')
 
     c = Connection(s, user=args.user, password=args.password, authentication=authentication)
+
     log_info('Binding to host')
     # perform the Bind operation
     if not c.bind():
